@@ -1,63 +1,287 @@
-:root {
-  --bg: #0a0514;
-  --accent: #c64bff;
-  --accent2: #ff4fd8;
-  --accent3: #4ff0ff;
-  --fg: #f4f4ff;
-}
-
-* { box-sizing: border-box; }
+/* ── Global reset ─────────────────────────────────────────── */
+* { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body {
-  margin: 0;
-  padding: 0;
-  background: var(--bg);
-  color: var(--fg);
-  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  width: 100%;
   height: 100%;
   overflow: hidden;
+  background: #000;
+  color: #f4f4ff;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
 
-body {
+/* Three.js appends a <canvas> to the body — make it fill the viewport */
+canvas {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+}
+
+/* ── Utility ─────────────────────────────────────────────── */
+.hidden { display: none !important; }
+
+/* ── Menu overlay ────────────────────────────────────────── */
+/* Covers the full screen on top of the 3D scene background */
+#menu {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  /* Semi-transparent dark layer so the 3D farm shows through */
+  background: radial-gradient(ellipse at center, rgba(0,0,0,0.5), rgba(0,0,0,0.8));
+  text-align: center;
+}
+
+#menu-title {
+  font-size: 3.5rem;
+  font-weight: 900;
+  color: #7fff44;
+  text-shadow:
+    0 0 30px rgba(127,255,68,0.6),
+    0 4px 8px rgba(0,0,0,0.5);
+  letter-spacing: 0.04em;
+  margin-bottom: 0.2rem;
+}
+
+#menu-subtitle {
+  font-size: 1rem;
+  color: rgba(255,255,255,0.5);
+  font-style: italic;
+  margin-bottom: 2rem;
+}
+
+/* ── Lobby panel ─────────────────────────────────────────── */
+#lobby {
+  background: rgba(0,0,0,0.4);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 12px;
+  padding: 1rem 1.5rem;
+  min-width: 280px;
+  margin-bottom: 1.5rem;
+}
+
+#lobby-status {
+  font-size: 0.85rem;
+  color: #4ff0ff;
+  text-shadow: 0 0 8px #4ff0ff;
+  margin-bottom: 0.75rem;
+}
+
+#player-list {
+  list-style: none;
+  text-align: left;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+#player-list li {
+  padding: 0.3rem 0.5rem;
+  font-size: 0.9rem;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+#player-list li:last-child {
+  border-bottom: none;
+}
+
+/* Small colored dot next to each player name */
+.player-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+/* "Queued" badge next to players who are ready */
+.queued-badge {
+  font-size: 0.7rem;
+  color: #7fff44;
+  margin-left: auto;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* ── Menu button row ─────────────────────────────────────── */
+#menu-buttons {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+/* ── Queue button ────────────────────────────────────────── */
+#queue-btn {
+  font-size: 1.2rem;
+  font-weight: 700;
+  padding: 0.8rem 2.5rem;
+  border: 2px solid #7fff44;
+  border-radius: 8px;
+  background: rgba(127,255,68,0.1);
+  color: #7fff44;
+  cursor: pointer;
+  transition: all 0.2s;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+#queue-btn:hover:not(:disabled) {
+  background: rgba(127,255,68,0.25);
+  box-shadow: 0 0 20px rgba(127,255,68,0.3);
+}
+
+#queue-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+#queue-btn.queued {
+  border-color: #ff4fd8;
+  color: #ff4fd8;
+  background: rgba(255,79,216,0.1);
+}
+
+/* ── Settings button (smaller, secondary style) ──────────── */
+#settings-btn {
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 0.55rem 1.2rem;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.05);
+  color: rgba(255,255,255,0.8);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+#settings-btn:hover {
+  background: rgba(255,255,255,0.15);
+  border-color: rgba(255,255,255,0.5);
+}
+
+/* ── Settings modal ──────────────────────────────────────── */
+#settings-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 30;  /* above the menu */
   display: flex;
   align-items: center;
   justify-content: center;
-  background:
-    radial-gradient(ellipse at top, rgba(198,75,255,0.18), transparent 55%),
-    radial-gradient(ellipse at bottom, rgba(255,79,216,0.12), transparent 55%),
-    var(--bg);
+  background: rgba(0,0,0,0.7);
 }
 
-#game {
-  max-width: 95vw;
-  max-height: 85vh;
-  background: #120826;
-  border: 2px solid var(--accent);
-  border-radius: 10px;
-  box-shadow: 0 0 80px rgba(198, 75, 255, 0.55);
-  image-rendering: pixelated;
+#settings-panel {
+  background: #1a1428;
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 12px;
+  padding: 2rem;
+  min-width: 360px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.6);
 }
 
+#settings-panel h2 {
+  margin-bottom: 1.5rem;
+  color: #7fff44;
+  text-shadow: 0 0 10px rgba(127,255,68,0.4);
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1.2rem;
+}
+
+.setting-row label {
+  flex: 0 0 80px;
+  font-size: 0.95rem;
+  color: rgba(255,255,255,0.85);
+}
+
+#volume-slider {
+  flex: 1;
+  accent-color: #7fff44;  /* makes the slider thumb match our theme */
+}
+
+#volume-value {
+  flex: 0 0 40px;
+  font-size: 0.85rem;
+  color: #7fff44;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+#nudity-toggle {
+  flex: 1;
+  padding: 0.4rem 1rem;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-radius: 6px;
+  background: rgba(255,255,255,0.05);
+  color: rgba(255,255,255,0.6);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+#nudity-toggle[data-on="true"] {
+  border-color: #ff4fd8;
+  color: #ff4fd8;
+  background: rgba(255,79,216,0.15);
+}
+
+#settings-close {
+  margin-top: 0.5rem;
+  width: 100%;
+  padding: 0.6rem;
+  border: 2px solid rgba(127,255,68,0.4);
+  border-radius: 6px;
+  background: rgba(127,255,68,0.1);
+  color: #7fff44;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+#settings-close:hover {
+  background: rgba(127,255,68,0.2);
+}
+
+/* ── Countdown display ───────────────────────────────────── */
+#countdown-display {
+  margin-top: 1rem;
+  font-size: 1.8rem;
+  font-weight: 900;
+  color: #ffcc00;
+  text-shadow: 0 0 15px rgba(255,204,0,0.5);
+  min-height: 2.5rem; /* prevent layout shift */
+}
+
+/* ── HUD overlay (during gameplay) ───────────────────────── */
 #hud {
   position: fixed;
   top: 1rem;
   left: 1rem;
   font-size: 0.95rem;
-  text-shadow: 0 0 10px var(--accent);
+  text-shadow: 0 2px 6px rgba(0,0,0,0.7);
   z-index: 10;
   pointer-events: none;
 }
 
 #username {
   font-weight: bold;
-  color: var(--accent2);
+  color: #ff4fd8;
   font-size: 1.1rem;
 }
 
 #peers {
   font-size: 0.8rem;
-  color: var(--accent3);
-  text-shadow: 0 0 8px var(--accent3);
+  color: #4ff0ff;
+  text-shadow: 0 0 8px #4ff0ff;
   margin-top: 0.15rem;
   letter-spacing: 0.02em;
 }
