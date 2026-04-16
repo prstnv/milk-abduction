@@ -704,17 +704,24 @@ function updateQueue() {
 
       if (remaining <= 0) {
         // ── Role assignment: host picks one queued player as alien ──
-        // Collect the IDs of everyone queued (self included).
+        // Only count peers we've heard a broadcast from within the
+        // heartbeat window. This is critical: if we pick a ghost peer
+        // as alien, nobody's selfId matches and everyone becomes a cow.
+        const now = Date.now();
+        const FRESH_MS = PEER_TIMEOUT_MS;
+
         const queuedIds = selfQueued ? [selfId] : [];
         for (const [peerId, peer] of peers) {
-          if (peer?.queued) queuedIds.push(peerId);
+          const fresh = peer?.lastSeen && (now - peer.lastSeen < FRESH_MS);
+          if (peer?.queued && fresh) queuedIds.push(peerId);
         }
         console.log('[milk] (host) countdown elapsed, queuedIds:', queuedIds);
 
-        if (queuedIds.length === 0) {
-          // Defensive: shouldn't happen (queuedCount >= 2 implies ids exist),
-          // but if it does, bail instead of picking `undefined` as alien.
-          console.warn('[milk] (host) no queued IDs at elapsed — aborting start');
+        if (queuedIds.length < MIN_PLAYERS) {
+          // Not enough *live* queued players — restart the countdown.
+          // Safer than picking a ghost that'll leave everyone as a cow.
+          console.warn('[milk] (host) fewer than', MIN_PLAYERS,
+            'live queued players at elapse — restarting countdown');
           countdownEndTime = null;
           return;
         }
@@ -947,6 +954,37 @@ function broadcastSelf() {
   });
 }
 
+// ── Peer heartbeat / ghost removal ─────────────────────────
+// Trystero's onPeerLeave doesn't always fire — a tab closed abruptly,
+// a network blip, or a stale Nostr relay replay can leave phantom
+// peers in our map. We broadcast state ~15Hz, so if a peer hasn't
+// sent anything in PEER_TIMEOUT_MS, assume they're gone and cull.
+const PEER_TIMEOUT_MS = 6000;
+
+function cullStalePeers() {
+  const now = Date.now();
+  let culled = false;
+  for (const [id, peer] of peers) {
+    if (!peer) continue;
+    // Fall back to joinedAt if we've never received a state broadcast.
+    const last = peer.lastSeen ?? peer.joinedAt ?? 0;
+    if (now - last > PEER_TIMEOUT_MS) {
+      console.log('[milk] culling stale peer:', id,
+        peer.lastSeen ? '(no broadcast in 6s)' : '(never broadcast)');
+      if (peer.mesh) scene.remove(peer.mesh);
+      peers.delete(id);
+      culled = true;
+    }
+  }
+  if (culled) {
+    refreshPeerCount();
+    refreshPlayerList();
+  }
+}
+
+// Run every second — cheap, and catches ghosts quickly.
+setInterval(cullStalePeers, 1000);
+
 async function loadTrystero() {
   const urls = [
     'https://esm.run/trystero@0.23',
@@ -997,7 +1035,9 @@ async function setupMultiplayer() {
 
     room.onPeerJoin((id) => {
       console.log('[milk] peer joined:', id);
-      peers.set(id, null);
+      // Track when they joined — if they never broadcast state within
+      // PEER_TIMEOUT_MS, cullStalePeers() will remove them (ghost peer).
+      peers.set(id, { joinedAt: Date.now() });
       broadcastSelf();
       refreshPeerCount();
       refreshPlayerList();
@@ -1043,6 +1083,9 @@ async function setupMultiplayer() {
       peer.queued       = data.queued;
       peer.role         = data.role;
       peer.countdownMs  = data.countdownMs;   // only meaningful if this peer is host
+      // Heartbeat — updated on every broadcast received. Used by
+      // cullStalePeers() to detect ghost peers.
+      peer.lastSeen     = Date.now();
       peers.set(peerId, peer);
 
       refreshPlayerList();
