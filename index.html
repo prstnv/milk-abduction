@@ -64,6 +64,22 @@
   <div id="hint">Click to fly · Mouse to steer · WASD to move · Esc to release</div>
 </div>
 
+<!-- ── Abduction warning (only shown when cow is being beamed) ── -->
+<div id="abduction-warning" class="hidden">
+  <div id="abduction-label">ABDUCTION IN PROGRESS</div>
+  <div id="abduction-bar-wrap">
+    <div id="abduction-bar"></div>
+  </div>
+  <!-- Struggle mini-game prompt: a random key to mash at the right moment -->
+  <div id="struggle-prompt" class="hidden">
+    <div id="struggle-hint">STRUGGLE!</div>
+    <div id="struggle-key">E</div>
+  </div>
+</div>
+
+<!-- ── Abducted screen (latches once abducted) ── -->
+<div id="abducted-screen" class="hidden">ABDUCTED</div>
+
 <!-- Portal protocol library — must stay, it's the jam contract -->
 <script src="portal.js"></script>
 

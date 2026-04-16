@@ -47,6 +47,11 @@ const nudityToggleEl   = document.getElementById('nudity-toggle');
 const countdownEl      = document.getElementById('countdown-display');
 const hudEl            = document.getElementById('hud');
 const peerCountEl      = document.getElementById('peers');
+const abductionWarnEl  = document.getElementById('abduction-warning');
+const abductionBarEl   = document.getElementById('abduction-bar');
+const abductedScreenEl = document.getElementById('abducted-screen');
+const strugglePromptEl = document.getElementById('struggle-prompt');
+const struggleKeyEl    = document.getElementById('struggle-key');
 
 // ------------------------------------------------------------------
 // 4. Three.js scene setup
@@ -181,11 +186,37 @@ function buildUFO({ saucerColor = 0xaaaaaa, domeColor = 0x66ffaa } = {}) {
     g.add(bulb);
   }
 
-  // Save refs to the spinning bits for idle animation.
+  // ── Tractor beam cone ─────────────────────────────────
+  // An inverted (tip at UFO, wide at ground) translucent cone.
+  // Uses ConeGeometry which has its tip at +Y by default, so positioning
+  // it at (0, -height/2) puts the tip at the UFO and the wide base below.
+  // `open ended` (no cap) so you can see through the base.
+  const BEAM_HEIGHT = 40;
+  const BEAM_RADIUS = 8;
+  const beam = new THREE.Mesh(
+    new THREE.ConeGeometry(BEAM_RADIUS, BEAM_HEIGHT, 24, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: 0x99ff66,
+      transparent: true,
+      opacity: 0.28,
+      side: THREE.DoubleSide,    // visible from inside too
+      depthWrite: false,         // avoid z-fighting with what's inside
+    })
+  );
+  beam.position.y = -BEAM_HEIGHT / 2;  // tip flush with UFO center
+  beam.visible = false;                 // off until the alien hits Space
+  g.add(beam);
+
+  // Save refs to animatable parts.
   g.userData.saucer = sau;
   g.userData.dome   = dom;
+  g.userData.beam   = beam;
   return g;
 }
+
+// Beam geometry constants — shared so detection math matches the mesh.
+const BEAM_HEIGHT = 40;
+const BEAM_RADIUS = 8;
 
 // ------------------------------------------------------------------
 // 9. Helper: build a simple cow (boxy placeholder)
@@ -464,6 +495,33 @@ const keys = {};
 window.addEventListener('keydown', (e) => {
   keys[e.code] = true;
   if (e.code === 'Space') e.preventDefault();
+
+  // Struggle mini-game input — if an active prompt exists and the
+  // pressed letter matches, knock time off timeInBeam and flash green.
+  // A wrong key while a prompt is active flashes fail briefly.
+  if (strugglePromptKey && gameState === State.PLAYING && localRole === 'cow' && !cowAbducted) {
+    // e.code for letter keys is "KeyE", "KeyR", etc. We compare the last char.
+    const pressedLetter = e.code.startsWith('Key') ? e.code.slice(3) : '';
+    const now = performance.now();
+    if (pressedLetter === strugglePromptKey && now <= struggleEndsAt) {
+      timeInBeam = Math.max(0, timeInBeam - STRUGGLE_REWARD);
+      strugglePromptKey  = null;
+      struggleNextAt     = now + 400;              // brief gap before next
+      struggleFlashUntil = now + 250;
+      // Tag the key element for green flash via CSS class.
+      if (struggleKeyEl) {
+        struggleKeyEl.classList.remove('flash-fail');
+        struggleKeyEl.classList.add('flash-success');
+      }
+    } else if (pressedLetter && STRUGGLE_POOL.includes(pressedLetter)) {
+      // Wrong key (but still a struggle-pool key) — brief fail flash.
+      struggleFlashUntil = now + 200;
+      if (struggleKeyEl) {
+        struggleKeyEl.classList.remove('flash-success');
+        struggleKeyEl.classList.add('flash-fail');
+      }
+    }
+  }
 });
 window.addEventListener('keyup', (e) => {
   keys[e.code] = false;
@@ -501,6 +559,9 @@ let yaw   = 0;
 let pitch = 0;
 const ufoQuat = new THREE.Quaternion();
 
+// Beam state — true while alien is holding Space.
+let beamActive = false;
+
 function updateUFO(dt) {
   yaw   -= mouseDeltaX * MOUSE_SENSITIVITY;
   pitch -= mouseDeltaY * MOUSE_SENSITIVITY;
@@ -527,6 +588,13 @@ function updateUFO(dt) {
   ufo.quaternion.copy(ufoQuat);
   saucer.rotation.y += dt * 1.5;
   dome.rotation.y   += dt * 1.5;
+
+  // ── Beam ────────────────────────────────────────────────
+  // Hold Space to emit a tractor beam. The cone is parented to the UFO
+  // so it inherits the UFO's yaw + pitch — meaning you AIM the beam
+  // by tilting the saucer. Diving toward a cow points the beam forward.
+  beamActive = !!keys['Space'];
+  ufo.userData.beam.visible = beamActive;
 }
 
 function updatePlayCamera() {
@@ -546,40 +614,214 @@ const COW_SPEED      = 14;                          // ground speed (slower than
 const COW_CAM_OFFSET = new THREE.Vector3(0, 4, 8);  // camera: behind + above cow
 let cowYaw = 0;
 
+// Abduction state — while in the alien's beam, timeInBeam ticks up;
+// at ABDUCT_SECONDS it latches cowAbducted=true and the cow is taken.
+const ABDUCT_SECONDS    = 3.0;
+const BEAM_DECAY_FACTOR = 2.0;   // out-of-beam decays twice as fast
+let   timeInBeam        = 0;     // seconds of continuous beam contact (current run)
+let   cowAbducted       = false; // latched when timeInBeam >= ABDUCT_SECONDS
+let   cowLift           = 0;     // how far the cow visually lifts off the ground
+
+// ── Struggle mini-game (active while being beamed, not yet abducted) ──
+// Every STRUGGLE_INTERVAL seconds a random key prompt appears. The cow
+// has STRUGGLE_WINDOW seconds to hit it — success knocks STRUGGLE_REWARD
+// seconds off timeInBeam. Adds a real-time skill check so the cow has
+// agency during abduction instead of just watching the bar fill.
+const STRUGGLE_POOL     = ['E', 'R', 'F', 'T', 'G', 'Q'];
+const STRUGGLE_INTERVAL = 1.2;   // seconds between prompts
+const STRUGGLE_WINDOW   = 0.9;   // seconds to react before it expires
+const STRUGGLE_REWARD   = 0.8;   // seconds subtracted from timeInBeam on success
+let   strugglePromptKey = null;  // current key to press, or null if no prompt
+let   struggleEndsAt    = 0;     // perf-timestamp when the current prompt expires
+let   struggleNextAt    = 0;     // perf-timestamp when the next prompt may appear
+let   struggleFlashUntil = 0;    // perf-timestamp — show success/fail flash until then
+
+// Check if the player cow is inside any alien's active beam cone.
+// The beam now tilts with the UFO (see updateUFO comment), so we can't
+// just check "cow below alien". Instead we transform the cow's position
+// into the alien's local frame; the beam points along local -Y there,
+// so depth = -localY and radial distance = hypot(localX, localZ).
+const _invQuat = new THREE.Quaternion();
+const _local   = new THREE.Vector3();
+
+function findBeamingAlien() {
+  for (const peer of peers.values()) {
+    if (peer?.role !== 'alien' || !peer.beaming || !peer.mesh) continue;
+
+    // Inverse of the alien's quaternion transforms world → local.
+    _invQuat.copy(peer.mesh.quaternion).invert();
+    _local.copy(playerCow.position).sub(peer.mesh.position).applyQuaternion(_invQuat);
+
+    const depth = -_local.y;   // beam extends in local -Y
+    if (depth <= 0 || depth > BEAM_HEIGHT) continue;
+
+    const radialDist    = Math.hypot(_local.x, _local.z);
+    const radiusAtDepth = (depth / BEAM_HEIGHT) * BEAM_RADIUS;
+    if (radialDist < radiusAtDepth) return peer;
+  }
+  return null;
+}
+
 function updateCow(dt, time) {
+  // ── Abducted: frozen, sucked up into the nearest UFO ──
+  // Fixes the "UFO disappears" bug: previously we raised y indefinitely
+  // and the cow overshot above the UFO, leaving the camera staring at
+  // empty sky. Now we lerp the whole (x,y,z) toward the nearest alien.
+  if (cowAbducted) {
+    // Find any alien to be pulled toward (just take the first one).
+    let alienPos = null;
+    for (const peer of peers.values()) {
+      if (peer?.role === 'alien' && peer.mesh) {
+        alienPos = peer.mesh.position;
+        break;
+      }
+    }
+    if (alienPos) {
+      const k = Math.min(1, 1.8 * dt);   // ~1.8/s pull rate
+      playerCow.position.x += (alienPos.x - playerCow.position.x) * k;
+      playerCow.position.y += (alienPos.y - playerCow.position.y) * k;
+      playerCow.position.z += (alienPos.z - playerCow.position.z) * k;
+      // When we're close enough to the UFO, hide the cow mesh — we've
+      // been "consumed" by the UFO.
+      if (playerCow.position.distanceTo(alienPos) < 2.5) {
+        playerCow.visible = false;
+      }
+    } else {
+      // Fallback: no alien in sight (they disconnected?) — just rise.
+      playerCow.position.y += 8 * dt;
+    }
+    mouseDeltaX = 0;  mouseDeltaY = 0;  // eat input
+    // Slight spin while rising, for flavor.
+    playerCow.rotation.y += dt * 2;
+    animateCowLegs(playerCow, time, false);
+    return;
+  }
+
   cowYaw -= mouseDeltaX * MOUSE_SENSITIVITY;
   mouseDeltaX = 0;
-  mouseDeltaY = 0;  // (unused for cow, discarded so it doesn't pile up)
+  mouseDeltaY = 0;
 
   const forward = new THREE.Vector3(-Math.sin(cowYaw), 0, -Math.cos(cowYaw));
   const right   = new THREE.Vector3(
     -Math.sin(cowYaw - Math.PI / 2), 0, -Math.cos(cowYaw - Math.PI / 2)
   );
 
-  // Track whether any movement key is pressed — used for leg animation.
+  // ── Beam detection + abduction timer ──
+  const beamer = findBeamingAlien();
+  const inBeam = !!beamer;
+
+  if (inBeam) {
+    timeInBeam += dt;
+    // Keep the struggle prompts ticking while in beam.
+    updateStruggle();
+    if (timeInBeam >= ABDUCT_SECONDS) {
+      cowAbducted = true;
+      clearStruggle();
+      console.log('[milk] abducted!');
+    }
+  } else {
+    timeInBeam = Math.max(0, timeInBeam - dt * BEAM_DECAY_FACTOR);
+    if (timeInBeam === 0) clearStruggle();
+  }
+
+  // Track any movement key pressed — used for leg animation + for the
+  // broadcast's "moving" hint (future use). Applied to motion below.
   const moving =
     keys['KeyW'] || keys['ArrowUp']    ||
     keys['KeyS'] || keys['ArrowDown']  ||
     keys['KeyA'] || keys['ArrowLeft']  ||
     keys['KeyD'] || keys['ArrowRight'];
 
-  if (keys['KeyW'] || keys['ArrowUp'])    playerCow.position.addScaledVector(forward,  COW_SPEED * dt);
-  if (keys['KeyS'] || keys['ArrowDown'])   playerCow.position.addScaledVector(forward, -COW_SPEED * dt);
-  if (keys['KeyA'] || keys['ArrowLeft'])   playerCow.position.addScaledVector(right,   -COW_SPEED * dt);
-  if (keys['KeyD'] || keys['ArrowRight'])  playerCow.position.addScaledVector(right,    COW_SPEED * dt);
+  // While in-beam, movement is reduced (you're being pulled up).
+  const speedMul = inBeam ? 0.35 : 1.0;
+  if (keys['KeyW'] || keys['ArrowUp'])    playerCow.position.addScaledVector(forward,  COW_SPEED * speedMul * dt);
+  if (keys['KeyS'] || keys['ArrowDown'])   playerCow.position.addScaledVector(forward, -COW_SPEED * speedMul * dt);
+  if (keys['KeyA'] || keys['ArrowLeft'])   playerCow.position.addScaledVector(right,   -COW_SPEED * speedMul * dt);
+  if (keys['KeyD'] || keys['ArrowRight'])  playerCow.position.addScaledVector(right,    COW_SPEED * speedMul * dt);
 
-  // Clamp to play area; always on the ground.
+  // Lift visual — smoothly track timeInBeam fraction for feedback.
+  const targetLift = (timeInBeam / ABDUCT_SECONDS) * 4.0;
+  cowLift += (targetLift - cowLift) * 0.15;
+
+  // Clamp to play area.
   playerCow.position.x = Math.max(-190, Math.min(190, playerCow.position.x));
   playerCow.position.z = Math.max(-190, Math.min(190, playerCow.position.z));
-  playerCow.position.y = 0;
+  playerCow.position.y = cowLift;
 
-  // Face the direction we're looking. The cow's head is at local +X,
-  // and our forward is world -Z — rotating the group by (cowYaw + π/2)
-  // around Y maps local +X to the world forward direction.
   playerCow.rotation.y = cowYaw + Math.PI / 2;
 
-  // Swing legs based on whether we're moving.
   animateCowLegs(playerCow, time, moving);
+}
+
+// Reset struggle state — called when we leave the beam / get abducted /
+// game state changes, so no stale prompt hangs around.
+function clearStruggle() {
+  strugglePromptKey = null;
+  struggleEndsAt    = 0;
+  struggleNextAt    = 0;
+}
+
+// Per-frame struggle mini-game tick. Only runs while cow is being beamed.
+function updateStruggle() {
+  const now = performance.now();
+
+  // Expire an active prompt if the window elapsed without a press.
+  if (strugglePromptKey && now > struggleEndsAt) {
+    strugglePromptKey = null;
+    // Schedule next prompt after a short gap (so prompts don't chain).
+    struggleNextAt = now + 300;
+  }
+
+  // Spawn a new prompt when it's time.
+  if (!strugglePromptKey && now >= struggleNextAt) {
+    const pick = STRUGGLE_POOL[Math.floor(Math.random() * STRUGGLE_POOL.length)];
+    strugglePromptKey = pick;
+    struggleEndsAt    = now + STRUGGLE_WINDOW * 1000;
+    struggleNextAt    = now + STRUGGLE_INTERVAL * 1000;  // next cycle
+  }
+}
+
+// Update the bottom-center progress bar + the full-screen "ABDUCTED"
+// overlay based on current cow state. Called each frame during PLAYING.
+function updateAbductionHUD() {
+  // Only cows ever see these.
+  if (localRole !== 'cow') {
+    abductionWarnEl.classList.add('hidden');
+    abductedScreenEl.classList.add('hidden');
+    return;
+  }
+
+  // Latched abducted state — show the big full-screen overlay.
+  if (cowAbducted) {
+    abductionWarnEl.classList.add('hidden');
+    abductedScreenEl.classList.remove('hidden');
+    return;
+  }
+
+  // Mid-abduction — show the progress bar if we're actively being beamed.
+  if (timeInBeam > 0) {
+    abductionWarnEl.classList.remove('hidden');
+    abductedScreenEl.classList.add('hidden');
+    const pct = Math.min(100, (timeInBeam / ABDUCT_SECONDS) * 100);
+    abductionBarEl.style.width = pct + '%';
+
+    // Struggle mini-game prompt — show active key or hide if none.
+    const now = performance.now();
+    if (strugglePromptKey) {
+      strugglePromptEl.classList.remove('hidden');
+      struggleKeyEl.textContent = strugglePromptKey;
+    } else if (now > struggleFlashUntil) {
+      // No prompt and flash is done — hide the widget between prompts
+      // so the flash doesn't linger.
+      strugglePromptEl.classList.add('hidden');
+      struggleKeyEl.classList.remove('flash-success', 'flash-fail');
+    }
+  } else {
+    abductionWarnEl.classList.add('hidden');
+    abductedScreenEl.classList.add('hidden');
+    strugglePromptEl.classList.add('hidden');
+    struggleKeyEl.classList.remove('flash-success', 'flash-fail');
+  }
 }
 
 function updateCowCamera() {
@@ -951,15 +1193,23 @@ function broadcastSelf() {
     queued: selfQueued,
     state: gameState,
     countdownMs: isHost() ? displayCountdown : null,
+    // Ability state:
+    beaming:  localRole === 'alien' ? beamActive : false,
+    abducted: localRole === 'cow'   ? cowAbducted : false,
   });
 }
 
 // ── Peer heartbeat / ghost removal ─────────────────────────
 // Trystero's onPeerLeave doesn't always fire — a tab closed abruptly,
 // a network blip, or a stale Nostr relay replay can leave phantom
-// peers in our map. We broadcast state ~15Hz, so if a peer hasn't
-// sent anything in PEER_TIMEOUT_MS, assume they're gone and cull.
-const PEER_TIMEOUT_MS = 6000;
+// peers in our map. We broadcast state often enough to heartbeat
+// ourselves; if a peer hasn't sent anything in PEER_TIMEOUT_MS,
+// assume they're gone and cull.
+//
+// Timeout is generous because backgrounded browser tabs throttle both
+// requestAnimationFrame *and* setInterval down to ~1s. A tab that's
+// still alive but not focused should never cross this threshold.
+const PEER_TIMEOUT_MS = 12000;
 
 function cullStalePeers() {
   const now = Date.now();
@@ -1071,10 +1321,16 @@ async function setupMultiplayer() {
           peer.renderY  = data.y;
           peer.renderZ  = data.z;
         }
-        peer.targetX   = data.x;
-        peer.targetY   = data.y;
-        peer.targetZ   = data.z;
-        peer.targetYaw = data.yaw;
+        peer.targetX     = data.x;
+        peer.targetY     = data.y;
+        peer.targetZ     = data.z;
+        peer.targetYaw   = data.yaw;
+        peer.targetPitch = data.pitch ?? 0;
+
+        // Toggle the beam cone on peer UFOs based on their broadcast.
+        if (peer.meshType === 'ufo' && peer.mesh.userData.beam) {
+          peer.mesh.userData.beam.visible = !!data.beaming;
+        }
       }
 
       if (!peer) peer = {};
@@ -1083,6 +1339,8 @@ async function setupMultiplayer() {
       peer.queued       = data.queued;
       peer.role         = data.role;
       peer.countdownMs  = data.countdownMs;   // only meaningful if this peer is host
+      peer.beaming      = !!data.beaming;
+      peer.abducted     = !!data.abducted;
       // Heartbeat — updated on every broadcast received. Used by
       // cullStalePeers() to detect ghost peers.
       peer.lastSeen     = Date.now();
@@ -1107,6 +1365,15 @@ async function setupMultiplayer() {
 }
 
 setupMultiplayer();
+
+// ── Background-safe heartbeat ────────────────────────────
+// The main game loop broadcasts inside requestAnimationFrame, which
+// browsers throttle heavily (often down to 1fps, sometimes to zero)
+// for backgrounded/hidden tabs. This setInterval keeps a steady
+// stream of broadcasts even when the tab isn't focused, so peers
+// don't think we've silently disconnected. setInterval gets clamped
+// to ~1s in background but never fully paused.
+setInterval(() => { broadcastSelf(); }, 500);
 
 window.addEventListener('beforeunload', () => {
   if (room) {
@@ -1144,6 +1411,7 @@ function gameLoop() {
       updateCow(dt, time);
       updateCowCamera();
     }
+    updateAbductionHUD();
     checkPortalCollision();
 
     // Interpolate peer positions + rotate them to face their yaw.
@@ -1162,11 +1430,22 @@ function gameLoop() {
       peer.renderZ += dz * k;
       peer.mesh.position.set(peer.renderX, peer.renderY, peer.renderZ);
 
-      // Rotate the mesh. Cow head points +X so we add π/2 for cows.
+      // Rotate the mesh.
       if (peer.targetYaw !== undefined) {
-        peer.mesh.rotation.y = peer.meshType === 'cow'
-          ? peer.targetYaw + Math.PI / 2
-          : peer.targetYaw;
+        if (peer.meshType === 'cow') {
+          // Cow head points +X locally, so we add π/2 to face -Z world.
+          peer.mesh.rotation.y = peer.targetYaw + Math.PI / 2;
+        } else {
+          // UFO — apply yaw AND pitch via quaternion so the beam aims
+          // in the direction the remote alien is pointing.
+          const yawQ   = new THREE.Quaternion().setFromAxisAngle(
+            new THREE.Vector3(0, 1, 0), peer.targetYaw
+          );
+          const pitchQ = new THREE.Quaternion().setFromAxisAngle(
+            new THREE.Vector3(1, 0, 0), peer.targetPitch ?? 0
+          );
+          peer.mesh.quaternion.copy(yawQ).multiply(pitchQ);
+        }
       }
 
       // Animate legs for peer cows.
