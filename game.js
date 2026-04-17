@@ -14,6 +14,189 @@
 // ═══════════════════════════════════════════════════════════
 
 import * as THREE from 'three';
+import { FBXLoader }  from 'three/addons/loaders/FBXLoader.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+
+// ------------------------------------------------------------------
+// 0. Model loading — async, runs during early startup
+// ------------------------------------------------------------------
+// We pre-load all OBJ/MTL (animals + structures) and the FBX UFO
+// before creating any entities. The menu shows the ground + sky while
+// this runs (~1-2s on a decent connection). Everything is stored in
+// `models` so buildUFO/buildCow can clone from it.
+
+const models = { ufo: null, animals: {}, structures: {} };
+
+// Creature type ↔ skin variant mapping. Skins within the same creature
+// share gameplay abilities and stats, but look different. The selection
+// UI shows all skins grouped by their creature type.
+const CREATURES = {
+  Cow:    { skins: ['Cow', 'Bull'],                    icon: '🐄', ability: 'Sturdy — no special' },
+  Horse:  { skins: ['Horse', 'Horse_White', 'Donkey'], icon: '🐴', ability: 'Speed burst' },
+  Deer:   { skins: ['Deer', 'Stag'],                   icon: '🦌', ability: 'Leap' },
+  Dog:    { skins: ['ShibaInu', 'Husky', 'Wolf'],      icon: '🐕', ability: 'Quick dodge' },
+  Alpaca: { skins: ['Alpaca'],                         icon: '🦙', ability: 'Spit projectile' },
+  Fox:    { skins: ['Fox'],                            icon: '🦊', ability: 'Camouflage' },
+};
+
+// Flat list of all 12 skin names — used for loading + UI iteration.
+const ALL_SKINS = Object.values(CREATURES).flatMap(c => c.skins);
+
+// Given a skin name, which creature type does it belong to?
+function creatureTypeOfSkin(skin) {
+  for (const [type, info] of Object.entries(CREATURES)) {
+    if (info.skins.includes(skin)) return type;
+  }
+  return null;
+}
+
+// Per-creature gameplay stats. Skins within a creature type share stats —
+// picking Bull vs Cow is purely cosmetic, for example.
+//
+//   walkSpeed     — units/sec when walking (not sprinting)
+//   sprintMul     — sprint speed multiplier (Horse fastest, Dog next, etc.)
+//   staminaMax    — stamina pool (Horse has much more)
+//   staminaDrain  — stamina/sec lost while sprinting
+//   staminaRegen  — stamina/sec gained while not sprinting
+//   jumpForce     — initial up-velocity on jump (Deer = super jump)
+//   jumpCooldown  — seconds before another jump is allowed (Deer = 10s)
+//   attackClip    — animation clip name to play when attacking
+//   isProjectile  — true for Alpaca (spit projectile instead of melee)
+//
+//   attackDir: 'forward' (bite/headbutt) or 'backward' (hind-leg kick).
+//   specialJumpForce / specialJumpCooldown: Q-key super jump (Deer only).
+//
+const CREATURE_STATS = {
+  Cow:    { walkSpeed: 14, sprintMul: 1.7, staminaMax: 100, staminaDrain: 28, staminaRegen: 14, jumpForce: 13, jumpCooldown: 0.8, attackClip: 'Attack_Kick',     attackDir: 'backward' },
+  Horse:  { walkSpeed: 14, sprintMul: 2.3, staminaMax: 180, staminaDrain: 20, staminaRegen: 18, jumpForce: 13, jumpCooldown: 0.8, attackClip: 'Attack_Kick',     attackDir: 'backward' },
+  Deer:   { walkSpeed: 14, sprintMul: 1.7, staminaMax: 100, staminaDrain: 28, staminaRegen: 14, jumpForce: 13, jumpCooldown: 0.8, attackClip: 'Attack_Kick',     attackDir: 'backward', specialJumpForce: 28, specialJumpCooldown: 10 },
+  Dog:    { walkSpeed: 14, sprintMul: 2.0, staminaMax: 140, staminaDrain: 22, staminaRegen: 16, jumpForce: 16, jumpCooldown: 0.8, attackClip: 'Attack',          attackDir: 'forward'  },
+  Alpaca: { walkSpeed: 14, sprintMul: 1.7, staminaMax: 100, staminaDrain: 28, staminaRegen: 14, jumpForce: 13, jumpCooldown: 0.8, attackClip: 'Attack_Headbutt', attackDir: 'forward', isProjectile: true },
+  Fox:    { walkSpeed: 14, sprintMul: 1.7, staminaMax: 100, staminaDrain: 28, staminaRegen: 14, jumpForce: 13, jumpCooldown: 0.8, attackClip: 'Attack',          attackDir: 'forward'  },
+};
+
+function statsForSkin(skin) {
+  const type = creatureTypeOfSkin(skin);
+  return CREATURE_STATS[type] || CREATURE_STATS.Cow;
+}
+
+async function loadAllModels() {
+  const fbxLoader  = new FBXLoader();
+  const gltfLoader = new GLTFLoader();
+  const texLoader  = new THREE.TextureLoader();
+
+  // ── UFO (FBX + PBR textures) ──────────────────────────
+  try {
+    const ufo = await fbxLoader.loadAsync('models/ufo/UFO.fbx');
+    const baseColor = await texLoader.loadAsync('models/ufo/Textures/BaseColor1.png');
+    const emissiveTex = await texLoader.loadAsync('models/ufo/Textures/Emissive.png');
+    ufo.traverse((child) => {
+      if (child.isMesh) {
+        child.material = new THREE.MeshLambertMaterial({
+          map: baseColor,
+          emissiveMap: emissiveTex,
+          emissive: new THREE.Color(0xffffff),
+          emissiveIntensity: 0.5,
+        });
+        child.castShadow = true;
+      }
+    });
+    // FBX from Blender is often exported at 100× scale. Tweak this
+    // scalar to match gameplay — the primitive UFO was ~4 units wide.
+    ufo.scale.setScalar(0.6);
+    models.ufo = ufo;
+    console.log('[milk] loaded UFO model');
+  } catch (err) {
+    console.warn('[milk] UFO model failed, using primitives:', err.message);
+  }
+
+  // ── Animals (FBX with skeletal animations) ─────────────
+  // FBX files from Blender embed bones + animation clips. We store
+  // the whole loaded group as a template and clone with SkeletonUtils
+  // so each cow instance has an independent skeleton for animation.
+  //
+  // Per-animal scale: proportional to real-life sizes relative to cow.
+  // FBX scale ≈ 0.01 base (Blender 100× export), then multiplied by
+  // the real-life ratio.
+  // ── Animals: load each GLTF once as a template ───────────
+  // GLTF (glTF 2.0) files from Blender export MUCH more cleanly than
+  // FBX — the skeleton hierarchy survives SkeletonUtils.clone without
+  // stretching or half-animating artifacts. No pool hack needed.
+  for (const skin of ALL_SKINS) {
+    try {
+      const gltf = await gltfLoader.loadAsync(`models/animals/${skin}.gltf`);
+      const root = gltf.scene;
+
+      // GLTF is in meters natively (no cm→m conversion needed).
+      root.traverse((c) => {
+        if (c.isSkinnedMesh) {
+          c.frustumCulled = false;  // animated bones can push bbox out
+        }
+        if (c.isMesh) {
+          c.castShadow = true;
+          // GLTF materials usually work as-is, but let's simplify to
+          // MeshLambertMaterial to match the rest of the scene style
+          // (and avoid any PBR shading surprises).
+          const fixMat = (m) => new THREE.MeshLambertMaterial({
+            color: m?.color ? m.color.clone() : new THREE.Color(0xcccccc),
+            map: m?.map ?? null,
+          });
+          c.material = Array.isArray(c.material)
+            ? c.material.map(fixMat)
+            : fixMat(c.material);
+        }
+      });
+
+      // Attach the clips to the scene root so SkeletonUtils.clone + the
+      // mixer pipeline can find them on cloned instances.
+      root.animations = gltf.animations ?? [];
+
+      models.animals[skin] = root;
+      const clipNames = root.animations.map(c => c.name);
+      console.log(`[milk] ${skin}: loaded, clips: ${clipNames.join(', ')}`);
+    } catch (err) {
+      console.warn(`[milk] ${skin} GLTF failed:`, err.message);
+    }
+  }
+
+  // ── Structures (FBX) ──────────────────────────────────
+  const structNames = [
+    'Barn', 'BigBarn', 'ChickenCoop', 'Fence', 'Fence2', 'OpenBarn',
+    'Silo', 'Silo_House', 'SmallBarn', 'TowerWindmill',
+    'WaterTower', 'Well', 'Windmill',
+  ];
+  for (const name of structNames) {
+    try {
+      const fbx = await fbxLoader.loadAsync(`models/structures/${name}.fbx`);
+      fbx.scale.setScalar(0.01);  // cm → game units (same as animals)
+      // Same material fix as animals — handle multi-material arrays.
+      fbx.traverse((c) => {
+        if (c.isMesh) {
+          c.castShadow = true;
+          c.receiveShadow = true;
+          const fixMat = (m) => {
+            const color = m?.color ? m.color.clone() : new THREE.Color(0xcccccc);
+            return new THREE.MeshLambertMaterial({ color });
+          };
+          c.material = Array.isArray(c.material)
+            ? c.material.map(fixMat)
+            : fixMat(c.material);
+        }
+      });
+      const sbox = new THREE.Box3().setFromObject(fbx);
+      const ssize = sbox.getSize(new THREE.Vector3());
+      console.log(`[milk] ${name} struct size: ${ssize.x.toFixed(1)} × ${ssize.y.toFixed(1)} × ${ssize.z.toFixed(1)}`);
+
+      models.structures[name] = fbx;
+      console.log(`[milk] loaded ${name} structure (FBX)`);
+    } catch (err) {
+      console.warn(`[milk] ${name} structure FBX failed:`, err.message);
+    }
+  }
+
+  console.log('[milk] all models loaded');
+}
 
 // ------------------------------------------------------------------
 // 1. Game state machine
@@ -35,9 +218,14 @@ const nextTarget = await Portal.pickPortalTarget();
 // ------------------------------------------------------------------
 
 const menuEl           = document.getElementById('menu');
+const menuMainEl       = document.getElementById('menu-main');
+const animalSelectEl   = document.getElementById('animal-select');
+const animalGridEl     = document.getElementById('animal-grid');
+const readyBtnEl       = document.getElementById('ready-btn');
+const backBtnEl        = document.getElementById('back-btn');
+const joinBtnEl        = document.getElementById('join-btn');
 const lobbyStatusEl    = document.getElementById('lobby-status');
 const playerListEl     = document.getElementById('player-list');
-const queueBtnEl       = document.getElementById('queue-btn');
 const settingsBtnEl    = document.getElementById('settings-btn');
 const settingsModalEl  = document.getElementById('settings-modal');
 const settingsCloseEl  = document.getElementById('settings-close');
@@ -52,6 +240,11 @@ const abductionBarEl   = document.getElementById('abduction-bar');
 const abductedScreenEl = document.getElementById('abducted-screen');
 const strugglePromptEl = document.getElementById('struggle-prompt');
 const struggleKeyEl    = document.getElementById('struggle-key');
+const spectateInfoEl   = document.getElementById('spectate-info');
+const spectateHintEl   = document.getElementById('spectate-hint');
+const cowHudEl         = document.getElementById('cow-hud');
+const staminaBarEl     = document.getElementById('stamina-bar');
+const jumpBarEl        = document.getElementById('jump-bar');
 
 // ------------------------------------------------------------------
 // 4. Three.js scene setup
@@ -99,37 +292,52 @@ ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 scene.add(ground);
 
-const barn = new THREE.Mesh(
-  new THREE.BoxGeometry(16, 12, 20),
-  new THREE.MeshLambertMaterial({ color: 0x8b2500 })
-);
-barn.position.set(40, 6, -30);
-barn.castShadow = true;
-scene.add(barn);
+// ── Load all 3D models (async — blocks here until done) ──
+// The renderer already shows the ground + sky while this runs.
+await loadAllModels();
 
-const roof = new THREE.Mesh(
-  new THREE.ConeGeometry(14, 6, 4),
-  new THREE.MeshLambertMaterial({ color: 0x5c3317 })
-);
-roof.position.set(40, 15, -30);
-roof.rotation.y = Math.PI / 4;
-scene.add(roof);
+// ── Place farm structures on the map ─────────────────────
+// Each entry: { model, x, z, rotY (degrees), scale }.
+// Structures sit at y=0 (on the ground). If a model didn't load,
+// it's silently skipped — the game still runs, just emptier.
+const MAP_LAYOUT = [
+  // Central barn area
+  { model: 'Barn',          x:  40, z: -30,  rotY:   0, scale: 3.0 },
+  { model: 'SmallBarn',     x: -35, z: -50,  rotY:  45, scale: 3.0 },
+  { model: 'OpenBarn',      x:  70, z:  40,  rotY: -30, scale: 3.0 },
 
-for (let i = -5; i <= 5; i++) {
-  const post = new THREE.Mesh(
-    new THREE.BoxGeometry(0.4, 3, 0.4),
-    new THREE.MeshLambertMaterial({ color: 0xffffff })
-  );
-  post.position.set(i * 6, 1.5, 20);
-  scene.add(post);
-  if (i < 5) {
-    const rail = new THREE.Mesh(
-      new THREE.BoxGeometry(6, 0.3, 0.2),
-      new THREE.MeshLambertMaterial({ color: 0xffffff })
-    );
-    rail.position.set(i * 6 + 3, 2.2, 20);
-    scene.add(rail);
-  }
+  // Fences — create a loose corral
+  { model: 'Fence',  x:  15, z:  25, rotY:   0, scale: 3.0 },
+  { model: 'Fence',  x:  25, z:  25, rotY:   0, scale: 3.0 },
+  { model: 'Fence',  x:  35, z:  25, rotY:   0, scale: 3.0 },
+  { model: 'Fence2', x:  45, z:  25, rotY:   0, scale: 3.0 },
+  { model: 'Fence',  x: -10, z:  25, rotY:   0, scale: 3.0 },
+  { model: 'Fence2', x: -20, z:  25, rotY:   0, scale: 3.0 },
+  { model: 'Fence',  x:  10, z: -40, rotY:  90, scale: 3.0 },
+  { model: 'Fence',  x:  10, z: -50, rotY:  90, scale: 3.0 },
+
+  // Landmarks — visible from far away
+  { model: 'Silo',          x: -60, z: -20,  rotY:   0, scale: 3.0 },
+  { model: 'TowerWindmill', x:  90, z: -60,  rotY:  15, scale: 3.0 },
+  { model: 'WaterTower',    x: -80, z:  50,  rotY:   0, scale: 3.0 },
+  { model: 'Windmill',      x:  60, z:  80,  rotY: -20, scale: 3.0 },
+
+  // Scattered smaller buildings
+  { model: 'ChickenCoop',   x: -25, z:  35,  rotY:  60, scale: 3.0 },
+  { model: 'Well',          x:   0, z:  10,  rotY:   0, scale: 3.0 },
+  { model: 'Silo_House',    x: -55, z: -60,  rotY:   0, scale: 3.0 },
+  { model: 'BigBarn',       x:  80, z: -20,  rotY: 180, scale: 3.0 },
+];
+
+for (const s of MAP_LAYOUT) {
+  const template = models.structures[s.model];
+  if (!template) continue;
+  const mesh = template.clone();
+  mesh.position.set(s.x, 0, s.z);
+  mesh.rotation.y = (s.rotY * Math.PI) / 180;
+  // Multiply (not override) so the FBXLoader's unit conversion is preserved.
+  mesh.scale.multiplyScalar(s.scale);
+  scene.add(mesh);
 }
 
 // ------------------------------------------------------------------
@@ -157,59 +365,59 @@ if (incoming.ref) {
 // 8. Helper: build a UFO mesh (used for player + menu scene)
 // ------------------------------------------------------------------
 
-function buildUFO({ saucerColor = 0xaaaaaa, domeColor = 0x66ffaa } = {}) {
+function buildUFO() {
   const g = new THREE.Group();
 
-  const sau = new THREE.Mesh(
-    new THREE.SphereGeometry(2, 16, 8),
-    new THREE.MeshLambertMaterial({ color: saucerColor })
-  );
-  sau.scale.set(1, 0.3, 1);
-  sau.castShadow = true;
-  g.add(sau);
-
-  const dom = new THREE.Mesh(
-    new THREE.SphereGeometry(1, 12, 8),
-    new THREE.MeshLambertMaterial({ color: domeColor, transparent: true, opacity: 0.7 })
-  );
-  dom.position.y = 0.4;
-  dom.scale.set(1, 0.6, 1);
-  g.add(dom);
-
-  for (let i = 0; i < 8; i++) {
-    const angle = (i / 8) * Math.PI * 2;
-    const bulb = new THREE.Mesh(
-      new THREE.SphereGeometry(0.15, 6, 6),
-      new THREE.MeshBasicMaterial({ color: 0xffff00 })
+  // Clone the loaded FBX model if available; otherwise primitive fallback.
+  if (models.ufo) {
+    const clone = models.ufo.clone();
+    g.add(clone);
+  } else {
+    // Primitive fallback — flattened sphere + dome + rim lights.
+    const sau = new THREE.Mesh(
+      new THREE.SphereGeometry(2, 16, 8),
+      new THREE.MeshLambertMaterial({ color: 0xaaaaaa })
     );
-    bulb.position.set(Math.cos(angle) * 1.9, 0, Math.sin(angle) * 1.9);
-    g.add(bulb);
+    sau.scale.set(1, 0.3, 1);
+    sau.castShadow = true;
+    g.add(sau);
+
+    const dom = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 12, 8),
+      new THREE.MeshLambertMaterial({ color: 0x66ffaa, transparent: true, opacity: 0.7 })
+    );
+    dom.position.y = 0.4;
+    dom.scale.set(1, 0.6, 1);
+    g.add(dom);
+
+    for (let i = 0; i < 8; i++) {
+      const angle = (i / 8) * Math.PI * 2;
+      const bulb = new THREE.Mesh(
+        new THREE.SphereGeometry(0.15, 6, 6),
+        new THREE.MeshBasicMaterial({ color: 0xffff00 })
+      );
+      bulb.position.set(Math.cos(angle) * 1.9, 0, Math.sin(angle) * 1.9);
+      g.add(bulb);
+    }
   }
 
-  // ── Tractor beam cone ─────────────────────────────────
-  // An inverted (tip at UFO, wide at ground) translucent cone.
-  // Uses ConeGeometry which has its tip at +Y by default, so positioning
-  // it at (0, -height/2) puts the tip at the UFO and the wide base below.
-  // `open ended` (no cap) so you can see through the base.
-  const BEAM_HEIGHT = 40;
-  const BEAM_RADIUS = 8;
+  // ── Tractor beam cone (always added, regardless of model source) ──
+  const BH = 40, BR = 8;
   const beam = new THREE.Mesh(
-    new THREE.ConeGeometry(BEAM_RADIUS, BEAM_HEIGHT, 24, 1, true),
+    new THREE.ConeGeometry(BR, BH, 24, 1, true),
     new THREE.MeshBasicMaterial({
-      color: 0x99ff66,
-      transparent: true,
-      opacity: 0.28,
-      side: THREE.DoubleSide,    // visible from inside too
-      depthWrite: false,         // avoid z-fighting with what's inside
+      color: 0x99ff66, transparent: true, opacity: 0.28,
+      side: THREE.DoubleSide, depthWrite: false,
     })
   );
-  beam.position.y = -BEAM_HEIGHT / 2;  // tip flush with UFO center
-  beam.visible = false;                 // off until the alien hits Space
+  beam.position.y = -BH / 2;
+  beam.visible = false;
   g.add(beam);
 
-  // Save refs to animatable parts.
-  g.userData.saucer = sau;
-  g.userData.dome   = dom;
+  // userData.saucer/dome are only used for the idle spin animation
+  // on the primitive fallback. Null for loaded models — spin is skipped.
+  g.userData.saucer = null;
+  g.userData.dome   = null;
   g.userData.beam   = beam;
   return g;
 }
@@ -219,10 +427,79 @@ const BEAM_HEIGHT = 40;
 const BEAM_RADIUS = 8;
 
 // ------------------------------------------------------------------
-// 9. Helper: build a simple cow (boxy placeholder)
+// 9. Helper: build an animal (loaded model or boxy placeholder)
 // ------------------------------------------------------------------
+// Accepts an optional animal name ('Cow', 'Horse', 'Pig', etc.) to
+// clone from the model cache. Falls back to the primitive box-cow if
+// the model isn't loaded. For the class system later, each animal is
+// a separate OBJ with its own MTL colors.
 
-function buildCow() {
+// Legacy list name; alias for code that still references ANIMAL_NAMES.
+const ANIMAL_NAMES = ALL_SKINS;
+
+// Uniform scale multiplier per skin. GLTF exports are already in metres
+// so 1.0 = life-size; these tweaks normalise the pack's inconsistencies
+// and let us fine-tune Fox-vs-Horse sizing.
+const SKIN_SIZE = {
+  Cow: 1.0,   Bull: 1.1,
+  Horse: 1.2, Horse_White: 1.2, Donkey: 0.9,
+  Deer: 1.0,  Stag: 1.1,
+  ShibaInu: 0.45, Husky: 0.55, Wolf: 0.6,
+  Alpaca: 0.85,
+  Fox: 0.5,
+};
+
+function buildCow(skinName = 'Cow') {
+  const template = models.animals[skinName];
+  if (!template) return buildPrimitiveCow();
+
+  // OUTER group — where we put gameplay-facing transforms (position,
+  // yaw, size). Safe for any transform because it sits above both
+  // the SkinnedMesh and the skeleton bones.
+  const g = new THREE.Group();
+
+  // SkeletonUtils.clone duplicates the skeleton for independent animation.
+  // GLTF files behave cleanly here (unlike the old FBX pack).
+  // CRITICAL: do NOT rotate `inner` — rotating the SkinnedMesh ancestor
+  // causes bind-pose mismatch (the "stretched limbs" bug).
+  const inner = SkeletonUtils.clone(template);
+  g.add(inner);
+
+  // Per-skin uniform size (safe, doesn't distort skinning).
+  g.scale.setScalar(SKIN_SIZE[skinName] ?? 1.0);
+
+  // AnimationMixer attached to the cloned root. We preload EVERY clip
+  // we might need as an Action, all .play()-ed continuously but with
+  // weights controlling which is visible. Switching animations then
+  // just means lerping weights — no action.stop()/start() churn that
+  // causes stutter.
+  let mixer = null;
+  const actions = {};
+  if (template.animations?.length) {
+    mixer = new THREE.AnimationMixer(inner);
+    for (const clip of template.animations) {
+      const a = mixer.clipAction(clip);
+      a.play();
+      a.weight = 0;   // start all at zero; updater will pick one to ramp up
+      actions[clip.name] = a;
+    }
+    // Default to Idle at full weight — cow is standing still initially.
+    if (actions['Idle']) actions['Idle'].weight = 1;
+  }
+
+  g.userData.legs       = null;
+  g.userData.hasRig     = false;
+  g.userData.mixer      = mixer;
+  g.userData.actions    = actions;
+  // What animation is currently the "target" (for weight lerping).
+  // Starts as Idle; updateAnimalAnim() picks a new target each frame.
+  g.userData.currentClip = 'Idle';
+  g.userData.tailPivot  = null;
+  g.userData.animalName = skinName;
+  return g;
+}
+
+function buildPrimitiveCow() {
   const g = new THREE.Group();
 
   const whiteMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
@@ -360,7 +637,76 @@ function buildCow() {
 // ── Leg walk cycle ────────────────────────────────────────
 // `stride`: how much to swing (radians). `cadence`: steps per sec.
 // `moving`: 1 if walking, 0 if idle (legs lerp back to rest).
-function animateCowLegs(cow, time, moving) {
+// Flash every mesh in an animal group RED during stun. We lerp the
+// material's base color toward pure red (AND emissive) so the effect
+// is unmistakable in bright daylight. Caches the originals to restore.
+const _flashColor = new THREE.Color(0xff0000);
+function setStunFlash(animal, amount) {
+  animal.traverse((c) => {
+    if (!c.isMesh) return;
+    const mats = Array.isArray(c.material) ? c.material : [c.material];
+    for (const m of mats) {
+      if (!m || !m.color) continue;
+      // Cache baselines once per material so repeated calls restore cleanly.
+      if (!m.userData.baseColor) {
+        m.userData.baseColor = m.color.clone();
+        if (m.emissive) m.userData.baseEmissive = m.emissive.clone();
+      }
+      m.color.copy(m.userData.baseColor).lerp(_flashColor, amount);
+      if (m.emissive && m.userData.baseEmissive) {
+        m.emissive.copy(m.userData.baseEmissive).lerp(_flashColor, amount * 0.5);
+      }
+    }
+  });
+}
+
+// Animation state machine — set the given clip as the target, lerp all
+// action weights toward it (1 for the target, 0 for everything else).
+// Multiple actions play simultaneously but only the target has meaningful
+// weight, so no fighting / no stutter.
+function updateAnimalAnim(animal, dt, desiredClip) {
+  const { mixer, actions } = animal.userData;
+  if (!mixer || !actions) return;
+
+  // Resolve desiredClip against available action names (case-forgiving).
+  let target = desiredClip;
+  if (!actions[target]) {
+    for (const k of Object.keys(actions)) {
+      if (k.toLowerCase() === target.toLowerCase()) { target = k; break; }
+    }
+  }
+  if (!actions[target]) target = 'Idle';             // fallback
+  if (!actions[target]) target = Object.keys(actions)[0] ?? null;
+
+  // Log once when the clip actually changes (debugging aid).
+  if (animal.userData.currentClip !== target) {
+    if (animal === playerCow) {
+      console.log(`[milk] self anim → ${target}`);
+    } else {
+      // Peer animation change — useful for verifying broadcasts arrive.
+      const name = animal.userData.animalName || '?';
+      console.log(`[milk] peer (${name}) anim → ${target}`);
+    }
+  }
+  animal.userData.currentClip = target;
+  const k = Math.min(1, dt * 10);   // ~100ms crossfade
+  for (const [name, action] of Object.entries(actions)) {
+    const targetWeight = (name === target) ? 1 : 0;
+    action.weight += (targetWeight - action.weight) * k;
+  }
+  mixer.update(dt);
+}
+
+// Legacy entry point — a lot of call sites (menu cows, peer cows) still
+// call this with (cow, dt, time, moving). Routes to the state-machine
+// with a Walk/Idle choice since those callers don't track sprint/jump.
+function animateCowLegs(cow, dt, time, moving) {
+  if (cow.userData.mixer) {
+    updateAnimalAnim(cow, dt, moving ? 'Walk' : 'Idle');
+    return;
+  }
+
+  // Primitive fallback with pivot-based legs.
   const legs = cow.userData.legs;
   if (!legs) return;
 
@@ -391,7 +737,7 @@ const saucer = ufo.userData.saucer;
 const dome   = ufo.userData.dome;
 
 // Player cow mesh — used when `localRole === 'cow'`. Hidden until then.
-const playerCow = buildCow();
+let playerCow = buildCow();
 playerCow.visible = false;
 scene.add(playerCow);
 
@@ -411,7 +757,9 @@ scene.add(menuEntities);
 // when it arrives. They panic-scatter when a UFO gets close.
 const menuCows = [];
 for (let i = 0; i < 6; i++) {
-  const cow = buildCow();
+  // Pick a random skin for each menu cow so the title screen shows variety.
+  const randomSkin = ALL_SKINS[Math.floor(Math.random() * ALL_SKINS.length)];
+  const cow = buildCow(randomSkin);
   cow.position.set(
     (Math.random() - 0.5) * 80,
     0,
@@ -428,7 +776,7 @@ for (let i = 0; i < 6; i++) {
 
 // Menu UFOs — slowly chase the nearest cow, never actually catching them.
 const menuUFOs = [];
-for (let i = 0; i < 2; i++) {
+for (let i = 0; i < 1; i++) {
   const u = buildUFO();
   u.position.set(
     (Math.random() - 0.5) * 60,
@@ -454,14 +802,15 @@ function updateMenuEntities(dt, time) {
     } else {
       c.mesh.position.x += (dx / dist) * c.speed * dt;
       c.mesh.position.z += (dz / dist) * c.speed * dt;
-      // Face direction of movement. The cow's head is at local +X,
-      // and atan2(dx, dz) gives the world yaw the cow is heading — so
-      // we add π/2 (same as the gameplay cow) to align.
-      c.mesh.rotation.y = Math.atan2(dx, dz) + Math.PI / 2;
+      // Face direction of movement. The inner model already rotates +π/2
+      // (nose +Z → +X). The gameplay/peer code adds another +π/2 on the
+      // group — but atan2(dx,dz) already gives the raw world angle, so
+      // we DON'T add π/2 here or the two offsets stack to π (backwards).
+      c.mesh.rotation.y = Math.atan2(dx, dz);
       moving = true;
     }
     // Walk animation while moving.
-    animateCowLegs(c.mesh, time, moving);
+    animateCowLegs(c.mesh, dt, time, moving);
   }
 
   // Each UFO picks the nearest cow and drifts toward it.
@@ -481,9 +830,9 @@ function updateMenuEntities(dt, time) {
       // Face direction
       u.mesh.rotation.y = Math.atan2(dir.x, dir.z);
     }
-    // Spin the saucer
-    u.mesh.userData.saucer.rotation.y += dt * 2;
-    u.mesh.userData.dome.rotation.y   += dt * 2;
+    // Spin the saucer (only exists on the primitive fallback, null on loaded models).
+    if (u.mesh.userData.saucer) u.mesh.userData.saucer.rotation.y += dt * 2;
+    if (u.mesh.userData.dome)   u.mesh.userData.dome.rotation.y   += dt * 2;
   }
 }
 
@@ -495,6 +844,12 @@ const keys = {};
 window.addEventListener('keydown', (e) => {
   keys[e.code] = true;
   if (e.code === 'Space') e.preventDefault();
+
+  // Spectate cycling — arrow keys while abducted + cow hidden.
+  if (cowAbducted && !playerCow.visible) {
+    if (e.code === 'ArrowRight') cycleSpectate(1);
+    if (e.code === 'ArrowLeft')  cycleSpectate(-1);
+  }
 
   // Struggle mini-game input — if an active prompt exists and the
   // pressed letter matches, knock time off timeInBeam and flash green.
@@ -531,9 +886,19 @@ const MOUSE_SENSITIVITY = 0.003;
 let mouseDeltaX = 0;
 let mouseDeltaY = 0;
 
-renderer.domElement.addEventListener('click', () => {
-  if (gameState === State.PLAYING) {
+// mousedown: first click requests pointer lock; subsequent clicks while
+// locked are role-specific actions (cow attack on left click, etc.).
+renderer.domElement.addEventListener('mousedown', (e) => {
+  if (gameState !== State.PLAYING) return;
+
+  if (!document.pointerLockElement) {
     renderer.domElement.requestPointerLock();
+    return;
+  }
+
+  // Pointer is locked — route clicks to actions.
+  if (e.button === 0 && localRole === 'cow') {
+    tryAttack();
   }
 });
 
@@ -586,8 +951,9 @@ function updateUFO(dt) {
   ufo.position.z = Math.max(-190, Math.min(190, ufo.position.z));
 
   ufo.quaternion.copy(ufoQuat);
-  saucer.rotation.y += dt * 1.5;
-  dome.rotation.y   += dt * 1.5;
+  // Idle spin — only exists on the primitive fallback, null on loaded models.
+  if (saucer) saucer.rotation.y += dt * 1.5;
+  if (dome)   dome.rotation.y   += dt * 1.5;
 
   // ── Beam ────────────────────────────────────────────────
   // Hold Space to emit a tractor beam. The cone is parented to the UFO
@@ -611,8 +977,26 @@ function updatePlayCamera() {
 // relative to that yaw.
 
 const COW_SPEED      = 14;                          // ground speed (slower than UFO)
-const COW_CAM_OFFSET = new THREE.Vector3(0, 4, 8);  // camera: behind + above cow
+const COW_CAM_OFFSET = new THREE.Vector3(0, 6, 14); // camera: further behind + higher above cow
 let cowYaw = 0;
+
+// ── Ability state for the player's cow ───────────────────
+// These get reset on game start (see startGameWithRole).
+let cowStamina         = 100;    // current stamina (0..staminaMax)
+let cowSprinting       = false;  // true while Shift is held AND stamina > 0 AND moving
+let cowJumpVel         = 0;      // vertical velocity (units/sec) — non-zero while airborne
+let cowGrounded        = true;   // true when on the ground
+let cowJumpCooldownEnd = 0;      // perf-ms timestamp when next jump is allowed
+let cowSpecialJumpEnd  = 0;      // perf-ms timestamp when next SPECIAL jump is allowed (Q key, Deer only)
+let cowAttackEndTime   = 0;      // perf-ms timestamp — attack anim runs until this
+let cowAttackCooldownEnd = 0;    // perf-ms timestamp when next attack is allowed
+let cowStunnedUntil    = 0;      // perf-ms timestamp — we're stunned until this
+
+const GRAVITY          = 40;     // units/sec² downward acceleration
+const ATTACK_DURATION  = 0.8;    // seconds an attack anim plays
+const ATTACK_COOLDOWN  = 1.5;    // seconds between attacks
+const ATTACK_RANGE     = 5.0;    // game units — how close to hit a target
+const STUN_DURATION    = 2.0;    // seconds a stun lasts
 
 // Abduction state — while in the alien's beam, timeInBeam ticks up;
 // at ABDUCT_SECONDS it latches cowAbducted=true and the cow is taken.
@@ -682,9 +1066,11 @@ function updateCow(dt, time) {
       playerCow.position.y += (alienPos.y - playerCow.position.y) * k;
       playerCow.position.z += (alienPos.z - playerCow.position.z) * k;
       // When we're close enough to the UFO, hide the cow mesh — we've
-      // been "consumed" by the UFO.
+      // been "consumed" by the UFO. Release pointer lock so the cursor
+      // is free during spectate mode.
       if (playerCow.position.distanceTo(alienPos) < 2.5) {
         playerCow.visible = false;
+        if (document.pointerLockElement) document.exitPointerLock();
       }
     } else {
       // Fallback: no alien in sight (they disconnected?) — just rise.
@@ -693,13 +1079,18 @@ function updateCow(dt, time) {
     mouseDeltaX = 0;  mouseDeltaY = 0;  // eat input
     // Slight spin while rising, for flavor.
     playerCow.rotation.y += dt * 2;
-    animateCowLegs(playerCow, time, false);
+    animateCowLegs(playerCow, dt, time, false);
     return;
   }
 
   cowYaw -= mouseDeltaX * MOUSE_SENSITIVITY;
   mouseDeltaX = 0;
   mouseDeltaY = 0;
+
+  const now = performance.now();
+  const stunned = now < cowStunnedUntil;
+  const attacking = now < cowAttackEndTime;
+  const stats = statsForSkin(selectedAnimal);
 
   const forward = new THREE.Vector3(-Math.sin(cowYaw), 0, -Math.cos(cowYaw));
   const right   = new THREE.Vector3(
@@ -709,10 +1100,8 @@ function updateCow(dt, time) {
   // ── Beam detection + abduction timer ──
   const beamer = findBeamingAlien();
   const inBeam = !!beamer;
-
   if (inBeam) {
     timeInBeam += dt;
-    // Keep the struggle prompts ticking while in beam.
     updateStruggle();
     if (timeInBeam >= ABDUCT_SECONDS) {
       cowAbducted = true;
@@ -724,33 +1113,186 @@ function updateCow(dt, time) {
     if (timeInBeam === 0) clearStruggle();
   }
 
-  // Track any movement key pressed — used for leg animation + for the
-  // broadcast's "moving" hint (future use). Applied to motion below.
-  const moving =
+  // ── Input gathering ─────────────────────────────────────
+  // Movement input is gated out when stunned (can't move).
+  const movingInput = !stunned && (
     keys['KeyW'] || keys['ArrowUp']    ||
     keys['KeyS'] || keys['ArrowDown']  ||
     keys['KeyA'] || keys['ArrowLeft']  ||
-    keys['KeyD'] || keys['ArrowRight'];
+    keys['KeyD'] || keys['ArrowRight']
+  );
 
-  // While in-beam, movement is reduced (you're being pulled up).
-  const speedMul = inBeam ? 0.35 : 1.0;
-  if (keys['KeyW'] || keys['ArrowUp'])    playerCow.position.addScaledVector(forward,  COW_SPEED * speedMul * dt);
-  if (keys['KeyS'] || keys['ArrowDown'])   playerCow.position.addScaledVector(forward, -COW_SPEED * speedMul * dt);
-  if (keys['KeyA'] || keys['ArrowLeft'])   playerCow.position.addScaledVector(right,   -COW_SPEED * speedMul * dt);
-  if (keys['KeyD'] || keys['ArrowRight'])  playerCow.position.addScaledVector(right,    COW_SPEED * speedMul * dt);
+  // Sprint: Shift held + stamina left + actually moving.
+  const wantsSprint = !stunned && (keys['ShiftLeft'] || keys['ShiftRight']) && movingInput && cowStamina > 0;
+  cowSprinting = wantsSprint;
 
-  // Lift visual — smoothly track timeInBeam fraction for feedback.
-  const targetLift = (timeInBeam / ABDUCT_SECONDS) * 4.0;
-  cowLift += (targetLift - cowLift) * 0.15;
+  // ── Stamina tick ────────────────────────────────────────
+  if (cowSprinting) {
+    cowStamina = Math.max(0, cowStamina - stats.staminaDrain * dt);
+  } else {
+    cowStamina = Math.min(stats.staminaMax, cowStamina + stats.staminaRegen * dt);
+  }
+
+  // ── Jump (Space = normal, Q = super for creatures that have it) ─
+  // Normal jump (Space) is always on a short cooldown — every creature
+  // can hop regularly. Super jump (Q) is a separate ability with its
+  // own long cooldown (Deer only for now, via specialJumpForce).
+  if (!stunned && cowGrounded) {
+    if (keys['KeyQ'] && stats.specialJumpForce && now >= cowSpecialJumpEnd) {
+      // Super jump — launches much higher.
+      cowJumpVel = stats.specialJumpForce;
+      cowGrounded = false;
+      cowSpecialJumpEnd = now + stats.specialJumpCooldown * 1000;
+    } else if (keys['Space'] && now >= cowJumpCooldownEnd) {
+      // Normal jump.
+      cowJumpVel = stats.jumpForce;
+      cowGrounded = false;
+      cowJumpCooldownEnd = now + stats.jumpCooldown * 1000;
+    }
+  }
+
+  // ── Movement (horizontal) ───────────────────────────────
+  // Reduced while in beam (being pulled up), sprint multiplier when sprinting.
+  const beamSlow = inBeam ? 0.35 : 1.0;
+  const sprintMul = cowSprinting ? stats.sprintMul : 1.0;
+  const moveSpeed = stats.walkSpeed * sprintMul * beamSlow;
+
+  if (movingInput) {
+    if (keys['KeyW'] || keys['ArrowUp'])    playerCow.position.addScaledVector(forward,  moveSpeed * dt);
+    if (keys['KeyS'] || keys['ArrowDown'])   playerCow.position.addScaledVector(forward, -moveSpeed * dt);
+    if (keys['KeyA'] || keys['ArrowLeft'])   playerCow.position.addScaledVector(right,   -moveSpeed * dt);
+    if (keys['KeyD'] || keys['ArrowRight'])  playerCow.position.addScaledVector(right,    moveSpeed * dt);
+  }
+
+  // ── Vertical physics (jumping + gravity) ────────────────
+  cowJumpVel -= GRAVITY * dt;
+  let targetY = playerCow.position.y + cowJumpVel * dt;
+  // Beam lift adds on top — but only while grounded (can't lift mid-jump).
+  const beamLift = cowGrounded
+    ? (timeInBeam / ABDUCT_SECONDS) * 4.0
+    : 0;
+  cowLift += (beamLift - cowLift) * 0.15;
+  // Ground check: cowLift is the beam-pull offset; base ground is y=0.
+  const groundY = cowLift;
+  if (targetY <= groundY) {
+    targetY = groundY;
+    cowJumpVel = 0;
+    cowGrounded = true;
+  } else {
+    cowGrounded = false;
+  }
 
   // Clamp to play area.
   playerCow.position.x = Math.max(-190, Math.min(190, playerCow.position.x));
   playerCow.position.z = Math.max(-190, Math.min(190, playerCow.position.z));
-  playerCow.position.y = cowLift;
+  playerCow.position.y = targetY;
 
-  playerCow.rotation.y = cowYaw + Math.PI / 2;
+  playerCow.rotation.y = cowYaw + Math.PI;
 
-  animateCowLegs(playerCow, time, moving);
+  // ── Pick animation clip ─────────────────────────────────
+  // Priority: stunned → attack → jump → gallop → walk → idle.
+  let desiredClip = 'Idle';
+  if (stunned) {
+    // Per design: Death animation plays during stun (animal "downed").
+    // Abduction uses its own spin-rise, not Death, so Death here means
+    // "knocked out by another animal's attack".
+    desiredClip = 'Death';
+  } else if (attacking && actionNameFor(stats.attackClip, playerCow)) {
+    desiredClip = actionNameFor(stats.attackClip, playerCow);
+  } else if (!cowGrounded) {
+    desiredClip = actionNameFor('Gallop_Jump', playerCow) ?? 'Gallop';
+  } else if (movingInput && cowSprinting) {
+    desiredClip = 'Gallop';
+  } else if (movingInput) {
+    desiredClip = 'Walk';
+  }
+  updateAnimalAnim(playerCow, dt, desiredClip);
+
+  // Red flash while stunned — strong tint so the hit is unmistakable.
+  const flashAmount = stunned ? 0.9 : 0;
+  setStunFlash(playerCow, flashAmount);
+}
+
+// Try to attack: find any peer cow inside an attack CONE (direction
+// depends on creature — kickers hit behind, biters/headbutters hit in
+// front). Stun the first hit via Trystero.
+const ATTACK_CONE_HALF_ANGLE = Math.PI / 3;  // 60° half-angle = 120° total cone
+
+function tryAttack() {
+  const now = performance.now();
+  if (now < cowAttackCooldownEnd) {
+    console.log('[milk] attack on cooldown');
+    return;
+  }
+  if (cowStunnedUntil > now || cowAbducted) {
+    console.log('[milk] can\'t attack — stunned or abducted');
+    return;
+  }
+  if (localRole !== 'cow') return;
+
+  cowAttackEndTime = now + ATTACK_DURATION * 1000;
+  cowAttackCooldownEnd = now + ATTACK_COOLDOWN * 1000;
+
+  const stats = statsForSkin(selectedAnimal);
+
+  // Reset the attack animation's time so each attack plays from start.
+  const attackName = actionNameFor(stats.attackClip, playerCow);
+  const attackAction = attackName && playerCow.userData.actions?.[attackName];
+  if (attackAction) attackAction.time = 0;
+
+  // Cone direction: "forward" (bite/headbutt) or "backward" (kick).
+  // cowYaw=0 means facing world -Z. forward vector at that heading:
+  const forward = new THREE.Vector3(-Math.sin(cowYaw), 0, -Math.cos(cowYaw));
+  const coneAxis = stats.attackDir === 'backward'
+    ? forward.clone().multiplyScalar(-1)   // hind-leg kick points behind
+    : forward;                              // bite/headbutt points ahead
+
+  const cosLimit = Math.cos(ATTACK_CONE_HALF_ANGLE);
+
+  // Find a peer cow inside the cone (range + angle).
+  let victimId = null;
+  let victimDist = Infinity;
+  let candidatesChecked = 0;
+  for (const [peerId, peer] of peers) {
+    if (peer?.role !== 'cow' || peer.abducted || !peer.mesh) continue;
+    candidatesChecked++;
+
+    const toTarget = new THREE.Vector3()
+      .subVectors(peer.mesh.position, playerCow.position);
+    const dist = toTarget.length();
+    if (dist > ATTACK_RANGE || dist < 0.01) continue;
+
+    toTarget.divideScalar(dist);    // normalize
+    const dot = toTarget.dot(coneAxis);
+    if (dot < cosLimit) continue;    // outside cone angle
+
+    if (dist < victimDist) {
+      victimDist = dist;
+      victimId = peerId;
+    }
+  }
+
+  console.log(`[milk] attack fired (${stats.attackDir}), cone checked ${candidatesChecked} peer(s), hit:`, victimId);
+
+  if (victimId && sendAttackActionFn) {
+    try { sendAttackActionFn({ victimId }); } catch (err) {
+      console.error('[milk] sendAttackAction failed:', err);
+    }
+  }
+}
+
+// Returns the actual action key on the mesh that matches a desired
+// clip name. Some clip names differ slightly between animal packs
+// (e.g. "Jump_toIdle" vs "Jump_ToIdle"). Returns null if not present.
+function actionNameFor(wantedName, animal) {
+  if (!animal?.userData?.actions) return null;
+  const exact = animal.userData.actions[wantedName];
+  if (exact) return wantedName;
+  // Case-insensitive fallback.
+  for (const k of Object.keys(animal.userData.actions)) {
+    if (k.toLowerCase() === wantedName.toLowerCase()) return k;
+  }
+  return null;
 }
 
 // Reset struggle state — called when we leave the beam / get abducted /
@@ -824,6 +1366,33 @@ function updateAbductionHUD() {
   }
 }
 
+// Update the cow ability HUD bars (stamina + jump/special cooldown).
+// For creatures with a super jump (Deer), the jump bar shows the
+// special-jump cooldown (since normal jump is basically always ready).
+function updateCowHUD() {
+  if (localRole !== 'cow') return;
+  const stats = statsForSkin(selectedAnimal);
+  const now = performance.now();
+
+  if (staminaBarEl) {
+    staminaBarEl.style.width = ((cowStamina / stats.staminaMax) * 100).toFixed(0) + '%';
+  }
+  if (jumpBarEl) {
+    let remaining, total;
+    if (stats.specialJumpForce) {
+      remaining = Math.max(0, cowSpecialJumpEnd - now);
+      total = stats.specialJumpCooldown * 1000;
+      const label = jumpBarEl.parentElement?.previousElementSibling;
+      if (label && label.textContent !== 'SUPER') label.textContent = 'SUPER';
+    } else {
+      remaining = Math.max(0, cowJumpCooldownEnd - now);
+      total = stats.jumpCooldown * 1000;
+    }
+    const pct = 100 - (remaining / total) * 100;
+    jumpBarEl.style.width = Math.min(100, pct).toFixed(0) + '%';
+  }
+}
+
 function updateCowCamera() {
   const offset = COW_CAM_OFFSET.clone().applyAxisAngle(
     new THREE.Vector3(0, 1, 0), cowYaw
@@ -832,6 +1401,68 @@ function updateCowCamera() {
   const lookTarget = playerCow.position.clone();
   lookTarget.y += 2;  // look slightly above the cow
   camera.lookAt(lookTarget);
+}
+
+// ── Spectator mode (for abducted cows) ─────────────────────
+// After the cow is fully captured (mesh hidden), camera switches to
+// follow remaining alive peer cows. Left/Right arrow keys cycle the
+// target. If no cows are left, orbit the map like the menu camera.
+
+let spectateIndex = 0;   // which alive cow we're watching
+
+// Returns an array of peer objects that are alive cows (not abducted).
+function getAliveCowPeers() {
+  const alive = [];
+  for (const peer of peers.values()) {
+    if (peer?.role === 'cow' && !peer.abducted && peer.mesh) {
+      alive.push(peer);
+    }
+  }
+  return alive;
+}
+
+// Cycle spectate target forward (+1) or backward (-1).
+function cycleSpectate(dir) {
+  const alive = getAliveCowPeers();
+  if (alive.length === 0) return;
+  spectateIndex = ((spectateIndex + dir) % alive.length + alive.length) % alive.length;
+}
+
+function updateSpectateCamera(time) {
+  const alive = getAliveCowPeers();
+
+  if (alive.length === 0) {
+    // No cows left — do a menu-style orbit.
+    updateMenuCamera(time);
+    if (spectateInfoEl) spectateInfoEl.textContent = 'No cows remaining';
+    if (spectateHintEl) spectateHintEl.textContent = '';
+    return;
+  }
+
+  // Clamp index in case a cow got abducted since last frame.
+  spectateIndex = spectateIndex % alive.length;
+  const target = alive[spectateIndex];
+
+  // Camera follows the spectated cow's interpolated position.
+  const pos = target.mesh.position;
+  const yaw = target.targetYaw ?? 0;
+  const offset = COW_CAM_OFFSET.clone().applyAxisAngle(
+    new THREE.Vector3(0, 1, 0), yaw
+  );
+  camera.position.lerp(pos.clone().add(offset), 0.08);  // smooth transition
+  const lookTarget = pos.clone();
+  lookTarget.y += 2;
+  camera.lookAt(lookTarget);
+
+  // Update HUD.
+  if (spectateInfoEl) {
+    spectateInfoEl.textContent = `Spectating: ${target.username || 'cow'}`;
+  }
+  if (spectateHintEl) {
+    spectateHintEl.textContent = alive.length > 1
+      ? `← → to switch (${spectateIndex + 1}/${alive.length})`
+      : '';
+  }
 }
 
 // ------------------------------------------------------------------
@@ -909,6 +1540,7 @@ let countdownEndTime = null;        // only used by the host
 let displayCountdown = null;        // what to show on screen (ms)
 let selfId           = null;        // our Trystero peer id (set once connected)
 let sendStartAction  = null;        // trystero action: host → everyone says "start now"
+let sendAttackActionFn = null;      // trystero action: attacker notifies victim of a hit
 
 if (incoming.fromPortal) {
   selfQueued = true;
@@ -1008,23 +1640,98 @@ function updateQueue() {
 }
 
 // ------------------------------------------------------------------
-// 17. Queue button
+// 17. Menu navigation + animal selection + queue
 // ------------------------------------------------------------------
 
-queueBtnEl.addEventListener('click', () => {
+// Which skin the player chose. Used for spawning + broadcasting.
+let selectedAnimal = 'Cow';
+
+// Pretty display names for skins (replace underscores, etc).
+function displaySkin(skin) {
+  return skin.replace(/_/g, ' ').replace('White ', 'White ');  // "Horse_White" → "Horse White"
+}
+
+// ── Build the animal selection grid (once, at startup) ──
+// Groups skins by creature type. Skins within a group share the same
+// gameplay class — picking a different skin is purely cosmetic.
+for (const [creatureType, info] of Object.entries(CREATURES)) {
+  // Creature group header
+  const header = document.createElement('div');
+  header.className = 'creature-group-header';
+  header.innerHTML = `
+    <span class="creature-group-icon">${info.icon}</span>
+    <span class="creature-group-name">${creatureType}</span>
+    <span class="creature-group-ability">${info.ability}</span>
+  `;
+  animalGridEl.appendChild(header);
+
+  // Skin cards row
+  const row = document.createElement('div');
+  row.className = 'skin-row';
+  for (const skin of info.skins) {
+    const card = document.createElement('div');
+    card.className = 'animal-card';
+    card.dataset.animal = skin;
+    card.innerHTML = `
+      <div class="animal-card-name">${displaySkin(skin)}</div>
+    `;
+    card.addEventListener('click', () => {
+      animalGridEl.querySelectorAll('.animal-card').forEach(
+        (c) => c.classList.remove('selected')
+      );
+      card.classList.add('selected');
+      selectedAnimal = skin;
+      readyBtnEl.disabled = false;
+      readyBtnEl.textContent = `I'm Ready (${displaySkin(skin)})`;
+    });
+    row.appendChild(card);
+  }
+  animalGridEl.appendChild(row);
+}
+
+// ── Menu navigation ──────────────────────────────────────
+
+// "Join Game" → show animal selection.
+joinBtnEl.addEventListener('click', () => {
+  menuMainEl.classList.add('hidden');
+  animalSelectEl.classList.remove('hidden');
+});
+
+// "Back" → return to main menu, unqueue if we were queued.
+backBtnEl.addEventListener('click', () => {
+  animalSelectEl.classList.add('hidden');
+  menuMainEl.classList.remove('hidden');
+  if (selfQueued) {
+    selfQueued = false;
+    readyBtnEl.textContent = selectedAnimal
+      ? `I'm Ready (${selectedAnimal})`
+      : 'Pick an animal first';
+    readyBtnEl.classList.remove('queued');
+    broadcastSelf();
+  }
+});
+
+// "I'm Ready" — toggles queue on/off (same as old "Queue Up").
+readyBtnEl.addEventListener('click', () => {
   selfQueued = !selfQueued;
-  updateQueueButton();
+  updateReadyButton();
   broadcastSelf();
 });
 
-function updateQueueButton() {
+function updateReadyButton() {
   if (selfQueued) {
-    queueBtnEl.textContent = 'Waiting for players...';
-    queueBtnEl.classList.add('queued');
+    readyBtnEl.textContent = 'Waiting for players...';
+    readyBtnEl.classList.add('queued');
   } else {
-    queueBtnEl.textContent = 'Queue Up';
-    queueBtnEl.classList.remove('queued');
+    readyBtnEl.textContent = `I'm Ready (${selectedAnimal})`;
+    readyBtnEl.classList.remove('queued');
   }
+}
+
+// Called when multiplayer connects — enable the Join button.
+function enableJoinButton() {
+  joinBtnEl.disabled = false;
+  joinBtnEl.textContent = 'Join Game';
 }
 
 // ------------------------------------------------------------------
@@ -1127,7 +1834,10 @@ function startGameWithRole(alienId) {
     document.exitPointerLock();
   }
 
+  const hintEl = document.getElementById('hint');
+
   if (localRole === 'alien') {
+    if (hintEl) hintEl.textContent = 'Mouse aims · WASD moves · Space emits tractor beam';
     // Spawn the player as the UFO.
     ufo.visible = true;
     playerCow.visible = false;
@@ -1139,15 +1849,35 @@ function startGameWithRole(alienId) {
       ufo.position.set(returnPortalMesh.position.x + 8, 15, 0);
     }
   } else {
-    // Spawn the player as a cow at a random-ish ground position.
+    // Spawn the player as their chosen animal at a random ground position.
     ufo.visible = false;
-    playerCow.visible = true;
+
+    scene.remove(playerCow);
+    playerCow = buildCow(selectedAnimal);
     playerCow.position.set(
       (Math.random() - 0.5) * 50,
       0,
       (Math.random() - 0.5) * 50
     );
+    playerCow.visible = true;
+    scene.add(playerCow);
     cowYaw = 0;
+
+    // Initialise ability state based on the chosen creature's stats.
+    const stats = statsForSkin(selectedAnimal);
+    cowStamina           = stats.staminaMax;
+    cowSprinting         = false;
+    cowJumpVel           = 0;
+    cowGrounded          = true;
+    cowJumpCooldownEnd   = 0;
+    cowSpecialJumpEnd    = 0;
+    cowAttackEndTime     = 0;
+    cowAttackCooldownEnd = 0;
+    cowStunnedUntil      = 0;
+
+    // Show the cow ability HUD (stamina + jump bars).
+    if (cowHudEl) cowHudEl.classList.remove('hidden');
+    if (hintEl) hintEl.textContent = 'WASD move · Shift sprint · Space jump · Click attack';
   }
 }
 
@@ -1194,8 +1924,13 @@ function broadcastSelf() {
     state: gameState,
     countdownMs: isHost() ? displayCountdown : null,
     // Ability state:
-    beaming:  localRole === 'alien' ? beamActive : false,
-    abducted: localRole === 'cow'   ? cowAbducted : false,
+    beaming:    localRole === 'alien' ? beamActive : false,
+    abducted:   localRole === 'cow'   ? cowAbducted : false,
+    animalName: localRole === 'cow'   ? selectedAnimal : null,
+    // Cow animation state — so peers can render the correct clip.
+    // currentClip lets peers mirror walk/gallop/jump/attack/death directly.
+    currentClip: localRole === 'cow' ? (playerCow?.userData?.currentClip || 'Idle') : null,
+    grounded:    localRole === 'cow' ? cowGrounded : true,
   });
 }
 
@@ -1279,8 +2014,20 @@ async function setupMultiplayer() {
     sendStartAction = sendStart;
     getStart((payload) => {
       console.log('[milk] received start signal', payload);
-      // Payload carries the picked alien's peer ID.
       startGameWithRole(payload?.alienId);
+    });
+
+    // One-shot: an attacker hits a target. Target plays Death + is stunned.
+    // Payload: { victimId } — we only react if victimId === our selfId.
+    const [sendAttackAction, getAttackAction] = room.makeAction('attack');
+    sendAttackActionFn = sendAttackAction;
+    getAttackAction((payload) => {
+      console.log('[milk] received attack action:', payload, 'mySelfId:', selfId);
+      if (payload?.victimId === selfId && !cowAbducted && gameState === State.PLAYING) {
+        // Got hit! Apply stun.
+        cowStunnedUntil = performance.now() + STUN_DURATION * 1000;
+        console.log('[milk] I am the victim — stunned for', STUN_DURATION, 's');
+      }
     });
 
     room.onPeerJoin((id) => {
@@ -1312,7 +2059,9 @@ async function setupMultiplayer() {
         // (Re)build the mesh if it doesn't exist or role changed.
         if (!peer || !peer.mesh || peer.meshType !== desiredType) {
           if (peer?.mesh) scene.remove(peer.mesh);
-          const mesh = desiredType === 'ufo' ? buildUFO() : buildCow();
+          const mesh = desiredType === 'ufo'
+            ? buildUFO()
+            : buildCow(data.animalName || 'Cow');
           scene.add(mesh);
           peer = peer || {};
           peer.mesh     = mesh;
@@ -1341,6 +2090,7 @@ async function setupMultiplayer() {
       peer.countdownMs  = data.countdownMs;   // only meaningful if this peer is host
       peer.beaming      = !!data.beaming;
       peer.abducted     = !!data.abducted;
+      peer.currentClip  = data.currentClip || null;
       // Heartbeat — updated on every broadcast received. Used by
       // cullStalePeers() to detect ghost peers.
       peer.lastSeen     = Date.now();
@@ -1349,8 +2099,7 @@ async function setupMultiplayer() {
       refreshPlayerList();
     });
 
-    queueBtnEl.disabled = false;
-    updateQueueButton();
+    enableJoinButton();
     refreshPeerCount();
     refreshPlayerList();
     broadcastSelf();
@@ -1358,8 +2107,7 @@ async function setupMultiplayer() {
   } catch (err) {
     console.error('[milk] multiplayer setup failed:', err);
     lobbyStatusEl.textContent = 'Multiplayer offline — solo mode';
-    queueBtnEl.disabled = false;
-    updateQueueButton();
+    enableJoinButton();
     refreshPlayerList();
   }
 }
@@ -1407,16 +2155,29 @@ function gameLoop() {
     if (localRole === 'alien') {
       updateUFO(dt);
       updatePlayCamera();
+    } else if (cowAbducted && !playerCow.visible) {
+      // Abducted + mesh hidden → spectate remaining cows.
+      updateSpectateCamera(time);
     } else {
       updateCow(dt, time);
       updateCowCamera();
     }
     updateAbductionHUD();
+    updateCowHUD();
     checkPortalCollision();
 
     // Interpolate peer positions + rotate them to face their yaw.
     for (const peer of peers.values()) {
       if (!peer?.mesh) continue;
+
+      // Hide abducted peer cows — they've been captured, shouldn't
+      // float above the UFO on other players' screens.
+      if (peer.meshType === 'cow' && peer.abducted) {
+        peer.mesh.visible = false;
+        continue;
+      }
+      peer.mesh.visible = true;
+
       const k = Math.min(1, dt * 10);
 
       // Detect movement by how far behind the interp is from the target.
@@ -1433,8 +2194,9 @@ function gameLoop() {
       // Rotate the mesh.
       if (peer.targetYaw !== undefined) {
         if (peer.meshType === 'cow') {
-          // Cow head points +X locally, so we add π/2 to face -Z world.
-          peer.mesh.rotation.y = peer.targetYaw + Math.PI / 2;
+          // FBX nose is +Z local; our forward at yaw=0 is world -Z.
+          // Rotation of π maps +Z → -Z, so total = targetYaw + π.
+          peer.mesh.rotation.y = peer.targetYaw + Math.PI;
         } else {
           // UFO — apply yaw AND pitch via quaternion so the beam aims
           // in the direction the remote alien is pointing.
@@ -1450,7 +2212,17 @@ function gameLoop() {
 
       // Animate legs for peer cows.
       if (peer.meshType === 'cow') {
-        animateCowLegs(peer.mesh, time, movingAmount > 0.1);
+        // Use the peer's broadcast clip if present (they know if they're
+        // sprinting/jumping/attacking/stunned). Fall back to moving detect.
+        if (peer.currentClip && peer.mesh.userData.actions) {
+          updateAnimalAnim(peer.mesh, dt, peer.currentClip);
+        } else {
+          animateCowLegs(peer.mesh, dt, time, movingAmount > 0.1);
+        }
+        // Red stun flash — peer's currentClip is 'Death' while stunned.
+        // (Note: abducted cows are hidden, so Death here always means stunned.)
+        const peerStunned = peer.currentClip === 'Death';
+        setStunFlash(peer.mesh, peerStunned ? 0.9 : 0);
       }
     }
   }

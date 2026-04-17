@@ -20,21 +20,42 @@
 
 <!-- ── Menu overlay ─────────────────────────────────────── -->
 <div id="menu">
-  <h1 id="menu-title">Milk Abduction</h1>
-  <p id="menu-subtitle">a very serious farming simulation</p>
 
-  <div id="lobby">
-    <div id="lobby-status">Connecting...</div>
-    <ul id="player-list"></ul>
+  <!-- ── Main menu view ──────────────────────────────────── -->
+  <div id="menu-main">
+    <h1 id="menu-title">Milk Abduction</h1>
+    <p id="menu-subtitle">a very serious farming simulation</p>
+
+    <div id="lobby">
+      <div id="lobby-status">Connecting...</div>
+      <ul id="player-list"></ul>
+    </div>
+
+    <div id="menu-buttons">
+      <button id="join-btn" disabled>Connecting...</button>
+      <button id="settings-btn">Settings</button>
+    </div>
   </div>
 
-  <!-- Button row: Queue + Settings -->
-  <div id="menu-buttons">
-    <button id="queue-btn" disabled>Connecting...</button>
-    <button id="settings-btn">Settings</button>
-  </div>
-
+  <!-- Countdown lives OUTSIDE both views so it's visible whether
+       you're on the main menu or the animal selection screen. -->
   <div id="countdown-display"></div>
+
+  <!-- ── Animal selection view (hidden initially) ────────── -->
+  <div id="animal-select" class="hidden">
+    <h2 id="animal-select-title">Choose Your Animal</h2>
+    <p id="animal-select-sub">Each animal has a unique ability (coming soon)</p>
+
+    <div id="animal-grid">
+      <!-- Populated by game.js from ANIMAL_NAMES -->
+    </div>
+
+    <div id="animal-select-buttons">
+      <button id="ready-btn" disabled>Pick an animal first</button>
+      <button id="back-btn">Back</button>
+    </div>
+  </div>
+
 </div>
 
 <!-- ── Settings modal ───────────────────────────────────── -->
@@ -64,13 +85,24 @@
   <div id="hint">Click to fly · Mouse to steer · WASD to move · Esc to release</div>
 </div>
 
+<!-- ── Cow ability HUD (bottom-left) ────────────────────── -->
+<div id="cow-hud" class="hidden">
+  <div class="cow-hud-row">
+    <label>STAMINA</label>
+    <div class="cow-hud-bar-wrap"><div id="stamina-bar" class="cow-hud-bar"></div></div>
+  </div>
+  <div class="cow-hud-row">
+    <label>JUMP</label>
+    <div class="cow-hud-bar-wrap"><div id="jump-bar" class="cow-hud-bar jump"></div></div>
+  </div>
+</div>
+
 <!-- ── Abduction warning (only shown when cow is being beamed) ── -->
 <div id="abduction-warning" class="hidden">
   <div id="abduction-label">ABDUCTION IN PROGRESS</div>
   <div id="abduction-bar-wrap">
     <div id="abduction-bar"></div>
   </div>
-  <!-- Struggle mini-game prompt: a random key to mash at the right moment -->
   <div id="struggle-prompt" class="hidden">
     <div id="struggle-hint">STRUGGLE!</div>
     <div id="struggle-key">E</div>
@@ -78,7 +110,11 @@
 </div>
 
 <!-- ── Abducted screen (latches once abducted) ── -->
-<div id="abducted-screen" class="hidden">ABDUCTED</div>
+<div id="abducted-screen" class="hidden">
+  <div id="abducted-text">ABDUCTED</div>
+  <div id="spectate-info"></div>
+  <div id="spectate-hint">← → to spectate other cows</div>
+</div>
 
 <!-- Portal protocol library — must stay, it's the jam contract -->
 <script src="portal.js"></script>
